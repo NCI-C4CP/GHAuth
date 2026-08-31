@@ -10,7 +10,7 @@ const conflict = () => Object.assign(new Error('Update is not a fast forward'), 
  * Route-aware stand-in for octokit. Each handler may be overridden per test, and
  * every call is recorded so the resulting tree and commit can be asserted.
  */
-const fakeGit = ({ head = { commitSha: 'commit-base', treeSha: 'tree-base' }, index = null, overrides = {} } = {}) => {
+const fakeGit = ({ head = { commitSha: 'commit-base', treeSha: 'tree-base' }, overrides = {} } = {}) => {
     const calls = [];
 
     const handlers = {
@@ -19,17 +19,8 @@ const fakeGit = ({ head = { commitSha: 'commit-base', treeSha: 'tree-base' }, in
             return { data: { object: { sha: head.commitSha } } };
         },
         'GET /repos/{owner}/{repo}/git/commits/{commit_sha}': () => ({ data: { tree: { sha: head.treeSha } } }),
-        'GET /repos/{owner}/{repo}/contents/{path}': () => {
-            if (!index) throw notFound();
-            return {
-                data: {
-                    sha: 'index-sha',
-                    size: 10,
-                    encoding: 'base64',
-                    content: Buffer.from(JSON.stringify(index)).toString('base64')
-                }
-            };
-        },
+        // Recorded so a reintroduced index round-trip would show up as a call
+        'GET /repos/{owner}/{repo}/contents/{path}': () => { throw notFound(); },
         'POST /repos/{owner}/{repo}/git/trees': () => ({ data: { sha: 'tree-new' } }),
         'POST /repos/{owner}/{repo}/git/commits': () => ({ data: { sha: 'commit-new' } }),
         'PATCH /repos/{owner}/{repo}/git/refs/{ref}': () => ({ data: { ref: 'refs/heads/main' } }),
@@ -112,21 +103,26 @@ test('commitFiles never returns the raw ref response to the caller of the API la
     assert.ok(result.lastResponse, 'lastResponse should be present for rate limit extraction');
 });
 
-test('commitFiles writes index.json alongside the concept in a single tree', async () => {
+test('commitFiles writes only the given files into the tree', async () => {
     const octokit = fakeGit();
     await commit(octokit);
 
     const [treeCall] = octokit.callsTo('POST /repos/{owner}/{repo}/git/trees');
     const paths = treeCall.options.tree.map(entry => entry.path);
 
-    assert.deepStrictEqual(paths, ['123456789.json', 'index.json']);
+    assert.deepStrictEqual(paths, ['123456789.json']);
     assert.strictEqual(treeCall.options.base_tree, 'tree-base');
-
-    const index = JSON.parse(treeCall.options.tree.find(entry => entry.path === 'index.json').content);
-    assert.deepStrictEqual(index._files['123456789.json'], { key: 'alpha', object_type: 'QUESTION' });
 });
 
-test('commitFiles ignores a caller-supplied index.json rather than writing it twice', async () => {
+test('commitFiles never reads index.json', async () => {
+    const octokit = fakeGit();
+    await commit(octokit);
+
+    // The index round-trip was the bulk of save latency; it must not come back
+    assert.strictEqual(octokit.callsTo('GET /repos/{owner}/{repo}/contents/{path}').length, 0);
+});
+
+test('commitFiles skips a caller-supplied index.json so a stale copy is not rewritten', async () => {
     const octokit = fakeGit();
 
     await commit(octokit, {
@@ -137,16 +133,13 @@ test('commitFiles ignores a caller-supplied index.json rather than writing it tw
     });
 
     const [treeCall] = octokit.callsTo('POST /repos/{owner}/{repo}/git/trees');
-    const indexEntries = treeCall.options.tree.filter(entry => entry.path === 'index.json');
+    const paths = treeCall.options.tree.map(entry => entry.path);
 
-    assert.strictEqual(indexEntries.length, 1);
-    assert.ok(!JSON.parse(indexEntries[0].content)._files.stale);
+    assert.deepStrictEqual(paths, ['1.json']);
 });
 
-test('commitFiles marks deletions with a null sha and drops them from the index', async () => {
-    const octokit = fakeGit({
-        index: { _files: { '1.json': { key: 'a', object_type: 'QUESTION' } } }
-    });
+test('commitFiles marks deletions with a null sha', async () => {
+    const octokit = fakeGit();
 
     const result = await commit(octokit, { files: [], deletions: ['1.json'] });
 
@@ -155,12 +148,9 @@ test('commitFiles marks deletions with a null sha and drops them from the index'
 
     assert.strictEqual(deletion.sha, null);
     assert.strictEqual(result.deleted, 1);
-
-    const index = JSON.parse(treeCall.options.tree.find(entry => entry.path === 'index.json').content);
-    assert.ok(!index._files['1.json']);
 });
 
-test('commitFiles commits a file that is not valid JSON but leaves it out of the index', async () => {
+test('commitFiles commits a file that is not valid JSON without inspecting it', async () => {
     const octokit = fakeGit();
     await commit(octokit, { files: [{ path: 'broken.json', content: 'not json' }] });
 
@@ -168,9 +158,6 @@ test('commitFiles commits a file that is not valid JSON but leaves it out of the
     const paths = treeCall.options.tree.map(entry => entry.path);
 
     assert.ok(paths.includes('broken.json'));
-
-    const index = JSON.parse(treeCall.options.tree.find(entry => entry.path === 'index.json').content);
-    assert.ok(!index._files['broken.json']);
 });
 
 test('commitFiles creates the ref on a repository with no commits', async () => {
@@ -210,8 +197,8 @@ test('commitFiles retries when the branch moves and succeeds on a later attempt'
 
     assert.strictEqual(result.commitSha, 'commit-new');
     assert.strictEqual(attempts, 2);
-    // The index is re-read per attempt, since a competing commit may have changed it
-    assert.strictEqual(octokit.callsTo('GET /repos/{owner}/{repo}/contents/{path}').length, 2);
+    // Each attempt re-reads the branch head, since a competing commit moved it
+    assert.strictEqual(octokit.callsTo('GET /repos/{owner}/{repo}/git/ref/{ref}').length, 2);
 });
 
 test('commitFiles gives up with a 409 when the branch keeps moving', async () => {

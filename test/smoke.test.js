@@ -49,7 +49,7 @@ const ENDPOINTS = [
     { api: 'getUserRepositories', method: 'GET',  auth: true,  requires: [] },
     { api: 'getFiles',            method: 'GET',  auth: true,  requires: ['owner', 'repo', 'path'],                   in: 'query' },
     { api: 'deleteFile',          method: 'POST', auth: true,  requires: ['owner', 'repo', 'path', 'message', 'sha'], in: 'body' },
-    { api: 'getConcept',          method: 'GET',  auth: true,  requires: ['owner', 'repo', 'path'],                   in: 'query' },
+    { api: 'getConcept',          method: 'GET',  auth: true,  requires: ['owner', 'repo'],                            in: 'query' },
     { api: 'getConfig',           method: 'GET',  auth: true,  requires: ['owner', 'repo', 'path'],                   in: 'query' },
     { api: 'getTree',             method: 'GET',  auth: true,  requires: ['owner', 'repo', 'ref'],                    in: 'query' },
     { api: 'getFileContent',      method: 'GET',  auth: true,  requires: ['owner', 'repo', 'path'],                   in: 'query' },

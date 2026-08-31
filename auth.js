@@ -11,7 +11,6 @@ const { extractRateLimit } = require('./lib/rateLimit');
 const { logRequest } = require('./lib/logging');
 const { fetchSecrets } = require('./lib/secrets');
 const { API_VERSION, createClient, getFile, createFile, toBase64 } = require('./lib/github');
-const { manageIndexFile, readIndex, baseName } = require('./domain/indexFile');
 const { commitFiles } = require('./domain/gitData');
 const { getBaseConfig } = require('./domain/config');
 const { generateConceptID } = require('./domain/conceptId');
@@ -143,13 +142,12 @@ const ghauth = async (req, res) => {
                 }
             });
 
-            // Step 2: Update index.json
-            await manageIndexFile(octokit, owner, repo, path, 'index', 'update', content);
-
             const rateLimit = extractRateLimit(response);
             logRequest({ api, status: 200, startedAt, rateLimit });
             res.status(200).json({
                 data: response.data,
+                // Lets the client re-key its concept cache without re-reading the repository
+                treeSha: response.data.commit?.tree?.sha || null,
                 status: response.status,
                 rateLimit
             });
@@ -219,15 +217,11 @@ const ghauth = async (req, res) => {
                 }
             });
 
-            // Step 2: Update index.json
-            if (path !== 'config.json') {
-                await manageIndexFile(octokit, owner, repo, path, 'index', 'update', content);
-            }
-
             const rateLimit = extractRateLimit(response);
             logRequest({ api, status: 200, startedAt, rateLimit });
             res.status(200).json({
                 data: response.data,
+                treeSha: response.data.commit?.tree?.sha || null,
                 status: response.status,
                 rateLimit
             });
@@ -440,13 +434,11 @@ const ghauth = async (req, res) => {
                 }
             });
 
-            // Step 2: Update index files
-            await manageIndexFile(octokit, owner, repo, path, 'index', 'remove');
-
             const rateLimit = extractRateLimit(response);
             logRequest({ api, status: 200, startedAt, rateLimit });
             res.status(200).json({
                 data: response.data,
+                treeSha: response.data.commit?.tree?.sha || null,
                 status: response.status,
                 rateLimit
             });
@@ -461,28 +453,32 @@ const ghauth = async (req, res) => {
         const token = extractToken(req);
         if (!token) return sendUnauthorized(res, api, startedAt);
 
-        const conceptMissing = missingParams(req.query, ['owner', 'repo', 'path']);
+        const conceptMissing = missingParams(req.query, ['owner', 'repo']);
         if (conceptMissing.length) return sendMissingParams(res, api, startedAt, conceptMissing);
 
-        const { owner, repo, path } = req.query;
+        const { owner, repo } = req.query;
 
         try {
             const octokit = new Octokit({
                 auth: token
             });
 
-            // readIndex handles the >1MB case, where the contents API returns an empty body with a 200
-            const { index, response } = await readIndex(octokit, owner, repo, path);
+            // Concept files are named for their ID, so the tree listing is the set of
+            // taken IDs. HEAD resolves the default branch without a second lookup.
+            const response = await octokit.request('GET /repos/{owner}/{repo}/git/trees/{tree_sha}', {
+                owner,
+                repo,
+                tree_sha: 'HEAD',
+                recursive: '1',
+                headers: {
+                    'X-GitHub-Api-Version': API_VERSION
+                }
+            });
 
-            if (index === null) {
-                const error = new Error('Index file not found');
-                error.status = 404;
-                throw error;
-            }
-
-            // Keys are file names ("123456789.json"); compare against the bare ID
             const taken = new Set(
-                Object.keys(index._files || {}).map(name => baseName(name).replace(/\.json$/i, ''))
+                (response.data.tree || [])
+                    .filter(entry => entry.type === 'blob' && entry.path.endsWith('.json'))
+                    .map(entry => entry.path.replace(/^.*\//, '').replace(/\.json$/i, ''))
             );
 
             let conceptID;
@@ -493,19 +489,16 @@ const ghauth = async (req, res) => {
 
             const rateLimit = extractRateLimit(response);
 
-            logRequest({ api, status: 200, startedAt, rateLimit });
+            logRequest({ api, status: 200, startedAt, rateLimit, taken: taken.size, truncated: response.data.truncated === true });
             res.status(200).json({ conceptID, rateLimit });
         } catch (error) {
-            if (error.status === 404) {
-
-                const content = JSON.stringify({}, null, 2);
-                await createFile(token, owner, repo, path, toBase64(content), 'Create index file');
-
+            // 409 is GitHub's "Git Repository is empty" — every ID is available
+            if (error.status === 409 || error.status === 404) {
                 const conceptID = generateConceptID();
-                logRequest({ api, status: 200, startedAt, error: 'Index missing - created' });
+                logRequest({ api, status: 200, startedAt, empty: true });
                 return res.status(200).json({ conceptID });
             }
-            
+
             return sendError(res, api, startedAt, error);
         }
     }

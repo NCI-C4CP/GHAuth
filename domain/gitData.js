@@ -1,5 +1,4 @@
 const { API_VERSION } = require('../lib/github');
-const { readIndex, emptyIndex, applyUpdate, applyRemoval, finalizeIndex, baseName } = require('./indexFile');
 
 // The trees endpoint caps at 100k entries / 7MB. Concept files are small, but the
 // request still crosses Cloud Run, so batches are chunked well below the ceiling.
@@ -40,39 +39,10 @@ const readBranchHead = async (octokit, owner, repo, branch) => {
 };
 
 /**
- * Builds the index.json that should accompany this batch.
- *
- * Re-read on every attempt: a retry means someone else committed, so the index
- * this batch is amending has changed too.
- */
-const buildIndex = async (octokit, owner, repo, files, deletions) => {
-    const { index: storedIndex } = await readIndex(octokit, owner, repo);
-    const index = storedIndex || emptyIndex();
-
-    for (const file of files) {
-        if (file.path === 'index.json' || file.path === 'config.json') continue;
-
-        try {
-            applyUpdate(index, baseName(file.path), JSON.parse(file.content));
-        } catch {
-            // A file that is not valid JSON still belongs in the commit, just not the index
-            continue;
-        }
-    }
-
-    for (const path of deletions) {
-        applyRemoval(index, baseName(path));
-    }
-
-    return finalizeIndex(index);
-};
-
-/**
  * Commits any number of files as a single commit via the Git Data API.
  *
  * Replaces the per-file Contents API loop, which cost 2 writes per concept against
- * GitHub's 500-writes-per-hour secondary limit. Also makes the write atomic: the
- * concept files and index.json land in one commit and cannot diverge.
+ * GitHub's 500-writes-per-hour secondary limit.
  *
  * @param {Object} params
  * @param {Object} params.octokit - Authenticated client
@@ -117,18 +87,10 @@ const commitFiles = async ({ octokit, owner, repo, branch, message, files = [], 
     for (let attempt = 0; attempt < MAX_REF_RETRIES; attempt++) {
         const { commitSha: baseCommitSha, treeSha: baseTreeSha } = await readBranchHead(octokit, owner, repo, branch);
 
-        const index = await buildIndex(octokit, owner, repo, files, deletions);
-
+        // index.json is no longer maintained; skipped so a stale copy is never rewritten
         const tree = files
             .filter(file => file.path !== 'index.json')
             .map(file => ({ path: file.path, mode: BLOB_MODE, type: 'blob', content: file.content }));
-
-        tree.push({
-            path: 'index.json',
-            mode: BLOB_MODE,
-            type: 'blob',
-            content: JSON.stringify(index, null, 2)
-        });
 
         // A null sha removes the path from the resulting tree
         for (const path of deletions) {
