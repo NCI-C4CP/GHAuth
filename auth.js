@@ -124,9 +124,7 @@ const ghauth = async (req, res) => {
             const missing = missingParams(req.body, ['owner', 'repo', 'path', 'message', 'content']);
             if (missing.length) return sendMissingParams(res, api, startedAt, missing);
 
-            const octokit = new Octokit({
-                auth: token
-            });
+            const octokit = createClient(token);
 
             const { owner, repo, path, message, content } = req.body;
 
@@ -146,8 +144,10 @@ const ghauth = async (req, res) => {
             logRequest({ api, status: 200, startedAt, rateLimit });
             res.status(200).json({
                 data: response.data,
-                // Lets the client re-key its concept cache without re-reading the repository
-                treeSha: response.data.commit?.tree?.sha || null,
+                // Lets the client re-key its concept cache without re-reading the repository.
+                // Must be the commit SHA: getTree is called with a branch ref and GitHub
+                // answers with the resolved commit, so a tree SHA here would never match.
+                commitSha: response.data.commit?.sha || null,
                 status: response.status,
                 rateLimit
             });
@@ -199,9 +199,7 @@ const ghauth = async (req, res) => {
             const missing = missingParams(req.body, ['owner', 'repo', 'path', 'message', 'content', 'sha']);
             if (missing.length) return sendMissingParams(res, api, startedAt, missing);
 
-            const octokit = new Octokit({
-                auth: token
-            });
+            const octokit = createClient(token);
 
             const { owner, repo, path, message, content, sha } = req.body;
 
@@ -221,7 +219,7 @@ const ghauth = async (req, res) => {
             logRequest({ api, status: 200, startedAt, rateLimit });
             res.status(200).json({
                 data: response.data,
-                treeSha: response.data.commit?.tree?.sha || null,
+                commitSha: response.data.commit?.sha || null,
                 status: response.status,
                 rateLimit
             });
@@ -417,9 +415,7 @@ const ghauth = async (req, res) => {
             const missing = missingParams(req.body, ['owner', 'repo', 'path', 'message', 'sha']);
             if (missing.length) return sendMissingParams(res, api, startedAt, missing);
 
-            const octokit = new Octokit({
-                auth: token
-            });
+            const octokit = createClient(token);
 
             const { owner, repo, path, message, sha } = req.body;
 
@@ -438,7 +434,7 @@ const ghauth = async (req, res) => {
             logRequest({ api, status: 200, startedAt, rateLimit });
             res.status(200).json({
                 data: response.data,
-                treeSha: response.data.commit?.tree?.sha || null,
+                commitSha: response.data.commit?.sha || null,
                 status: response.status,
                 rateLimit
             });
@@ -570,8 +566,8 @@ const ghauth = async (req, res) => {
             logRequest({ api, status: 200, startedAt, rateLimit, entries: data.length, truncated: response.data.truncated === true });
             res.status(200).json({
                 data,
-                // Tree SHA, not commit SHA: this changes only when file content changes,
-                // so it is the cache key clients should key concept data on.
+                // Asking for a branch ref makes GitHub return the resolved commit SHA here,
+                // not a tree SHA. The write endpoints report the same value as commitSha.
                 sha: response.data.sha,
                 truncated: response.data.truncated === true,
                 status: response.status,
