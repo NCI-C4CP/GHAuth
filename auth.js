@@ -1,4 +1,3 @@
-const { Octokit } = require('octokit');
 const {
     setHeaders,
     extractToken,
@@ -96,9 +95,7 @@ const ghauth = async (req, res) => {
             const token = extractToken(req);
             if (!token) return sendUnauthorized(res, api, startedAt);
 
-            const octokit = new Octokit({
-                auth: token
-            });
+            const octokit = createClient(token);
 
             const response = await octokit.request('GET /user');
             const rateLimit = extractRateLimit(response);
@@ -238,9 +235,7 @@ const ghauth = async (req, res) => {
             const missing = missingParams(req.query, ['owner', 'repo']);
             if (missing.length) return sendMissingParams(res, api, startedAt, missing);
 
-            const octokit = new Octokit({
-                auth: token
-            });
+            const octokit = createClient(token);
 
             const { owner, repo, ref } = req.query;
 
@@ -276,9 +271,7 @@ const ghauth = async (req, res) => {
 
             const { owner, repo, query } = req.query;
 
-            const octokit = new Octokit({
-                auth: token
-            });
+            const octokit = createClient(token);
 
             // Use GitHub Search API to find JSON files containing the query term
             const searchQuery = `${query} in:file extension:json repo:${owner}/${repo}`;
@@ -333,9 +326,7 @@ const ghauth = async (req, res) => {
             const token = extractToken(req);
             if (!token) return sendUnauthorized(res, api, startedAt);
 
-            const octokit = new Octokit({
-                auth: token
-            });
+            const octokit = createClient(token);
 
             const response = await octokit.request('GET /user/repos', {
                 affiliation: 'owner, collaborator',
@@ -368,9 +359,7 @@ const ghauth = async (req, res) => {
             const missing = missingParams(req.query, ['owner', 'repo', 'path']);
             if (missing.length) return sendMissingParams(res, api, startedAt, missing);
 
-            const octokit = new Octokit({
-                auth: token
-            });
+            const octokit = createClient(token);
 
             const { owner, repo, path } = req.query;
 
@@ -455,9 +444,7 @@ const ghauth = async (req, res) => {
         const { owner, repo } = req.query;
 
         try {
-            const octokit = new Octokit({
-                auth: token
-            });
+            const octokit = createClient(token);
 
             // Concept files are named for their ID, so the tree listing is the set of
             // taken IDs. HEAD resolves the default branch without a second lookup.
