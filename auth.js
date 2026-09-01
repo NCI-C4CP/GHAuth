@@ -138,7 +138,7 @@ const ghauth = async (req, res) => {
             });
 
             const rateLimit = extractRateLimit(response);
-            logRequest({ api, status: 200, startedAt, rateLimit });
+            logRequest({ api, status: 200, startedAt, rateLimit, commitSha: response.data.commit?.sha, blobSha: response.data.content?.sha });
             res.status(200).json({
                 data: response.data,
                 // Lets the client re-key its concept cache without re-reading the repository.
@@ -213,7 +213,7 @@ const ghauth = async (req, res) => {
             });
 
             const rateLimit = extractRateLimit(response);
-            logRequest({ api, status: 200, startedAt, rateLimit });
+            logRequest({ api, status: 200, startedAt, rateLimit, commitSha: response.data.commit?.sha, blobSha: response.data.content?.sha });
             res.status(200).json({
                 data: response.data,
                 commitSha: response.data.commit?.sha || null,
@@ -420,7 +420,7 @@ const ghauth = async (req, res) => {
             });
 
             const rateLimit = extractRateLimit(response);
-            logRequest({ api, status: 200, startedAt, rateLimit });
+            logRequest({ api, status: 200, startedAt, rateLimit, commitSha: response.data.commit?.sha, blobSha: sha });
             res.status(200).json({
                 data: response.data,
                 commitSha: response.data.commit?.sha || null,
@@ -550,7 +550,7 @@ const ghauth = async (req, res) => {
                 .map(entry => ({ path: entry.path, sha: entry.sha, size: entry.size }));
 
             const rateLimit = extractRateLimit(response);
-            logRequest({ api, status: 200, startedAt, rateLimit, entries: data.length, truncated: response.data.truncated === true });
+            logRequest({ api, status: 200, startedAt, rateLimit, entries: data.length, sha: response.data.sha, truncated: response.data.truncated === true });
             res.status(200).json({
                 data,
                 // Asking for a branch ref makes GitHub return the resolved commit SHA here,
