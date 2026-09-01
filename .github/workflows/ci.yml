@@ -5,6 +5,10 @@ on:
     branches: [main]
   pull_request:
 
+# Checkout is the only thing that needs the token, so nothing else is granted.
+permissions:
+  contents: read
+
 jobs:
   test:
     runs-on: ubuntu-latest
