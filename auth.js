@@ -165,7 +165,7 @@ const ghauth = async (req, res) => {
 
             const octokit = createClient(token);
 
-            const { owner, repo, branch, message, files, deletions } = req.body;
+            const { owner, repo, branch, message, files, deletions, preconditions } = req.body;
 
             const { lastResponse, ...result } = await commitFiles({
                 octokit,
@@ -174,7 +174,8 @@ const ghauth = async (req, res) => {
                 branch,
                 message,
                 files: files || [],
-                deletions: deletions || []
+                deletions: deletions || [],
+                preconditions
             });
 
             const rateLimit = extractRateLimit(lastResponse);

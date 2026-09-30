@@ -1,7 +1,7 @@
 const test = require('node:test');
 const assert = require('node:assert');
 
-const { commitFiles, MAX_ENTRIES_PER_COMMIT, WRITES_PER_COMMIT } = require('../domain/gitData');
+const { commitFiles, blobSha, MAX_ENTRIES_PER_COMMIT, WRITES_PER_COMMIT } = require('../domain/gitData');
 
 const notFound = () => Object.assign(new Error('Not Found'), { status: 404 });
 const conflict = () => Object.assign(new Error('Update is not a fast forward'), { status: 422 });
@@ -10,7 +10,7 @@ const conflict = () => Object.assign(new Error('Update is not a fast forward'), 
  * Route-aware stand-in for octokit. Each handler may be overridden per test, and
  * every call is recorded so the resulting tree and commit can be asserted.
  */
-const fakeGit = ({ head = { commitSha: 'commit-base', treeSha: 'tree-base' }, overrides = {} } = {}) => {
+const fakeGit = ({ head = { commitSha: 'commit-base', treeSha: 'tree-base' }, baseTree = [], overrides = {} } = {}) => {
     const calls = [];
 
     const handlers = {
@@ -19,6 +19,9 @@ const fakeGit = ({ head = { commitSha: 'commit-base', treeSha: 'tree-base' }, ov
             return { data: { object: { sha: head.commitSha } } };
         },
         'GET /repos/{owner}/{repo}/git/commits/{commit_sha}': () => ({ data: { tree: { sha: head.treeSha } } }),
+        'GET /repos/{owner}/{repo}/git/trees/{tree_sha}': () => ({
+            data: { tree: baseTree.map(([path, sha]) => ({ path, sha, type: 'blob' })), truncated: false }
+        }),
         // Recorded so a reintroduced index round-trip would show up as a call
         'GET /repos/{owner}/{repo}/contents/{path}': () => { throw notFound(); },
         'POST /repos/{owner}/{repo}/git/trees': () => ({ data: { sha: 'tree-new' } }),
@@ -226,4 +229,150 @@ test('commitFiles propagates a ref failure that is not a conflict', async () => 
     });
 
     await assert.rejects(() => commit(octokit), error => error.status === 500);
+});
+
+test('blobSha matches git hash-object, counting bytes rather than characters', () => {
+    // printf '{"key":"café"}\n' | git hash-object --stdin
+    assert.strictEqual(blobSha('{"key":"café"}\n'), '12ea9265091769d0bc05cbe8b89c9352efee3849');
+});
+
+test('commitFiles returns the blob sha and size of each written file', async () => {
+    const content = '{"key":"café"}\n';
+    const result = await commit(fakeGit(), { files: [{ path: 'a.json', content }] });
+
+    assert.deepStrictEqual(result.files, [
+        { path: 'a.json', sha: '12ea9265091769d0bc05cbe8b89c9352efee3849', size: 16 }
+    ]);
+});
+
+test('commitFiles skips the base tree read when there are no preconditions', async () => {
+    const octokit = fakeGit();
+    await commit(octokit);
+
+    assert.strictEqual(octokit.callsTo('GET /repos/{owner}/{repo}/git/trees/{tree_sha}').length, 0);
+});
+
+test('commitFiles commits when every precondition holds', async () => {
+    const octokit = fakeGit({ baseTree: [['edited.json', 'blob-1'], ['target.json', 'blob-2']] });
+
+    const result = await commit(octokit, {
+        files: [
+            { path: 'edited.json', content: '{}' },
+            { path: 'new.json', content: '{}' }
+        ],
+        preconditions: {
+            absent: ['new.json'],
+            present: ['target.json'],
+            expected: { 'edited.json': 'blob-1' }
+        }
+    });
+
+    assert.strictEqual(result.commitSha, 'commit-new');
+
+    const [treeRead] = octokit.callsTo('GET /repos/{owner}/{repo}/git/trees/{tree_sha}');
+    assert.strictEqual(treeRead.options.tree_sha, 'tree-base');
+});
+
+test('commitFiles rejects each kind of failed precondition without writing anything', async () => {
+    const octokit = fakeGit({ baseTree: [['taken.json', 'blob-1'], ['edited.json', 'blob-theirs']] });
+
+    await assert.rejects(
+        () => commit(octokit, {
+            preconditions: {
+                absent: ['taken.json'],
+                present: ['deleted.json'],
+                expected: { 'edited.json': 'blob-mine', 'gone.json': 'blob-old' }
+            }
+        }),
+        error => {
+            assert.strictEqual(error.status, 409);
+            assert.deepStrictEqual(error.conflicts, [
+                { path: 'taken.json', reason: 'exists' },
+                { path: 'deleted.json', reason: 'missing' },
+                { path: 'edited.json', reason: 'changed' },
+                { path: 'gone.json', reason: 'missing' }
+            ]);
+            assert.match(error.message, /deleted\.json no longer exists/);
+            return true;
+        }
+    );
+
+    assert.strictEqual(octokit.callsTo('POST /repos/{owner}/{repo}/git/trees').length, 0);
+    assert.strictEqual(octokit.callsTo('PATCH /repos/{owner}/{repo}/git/refs/{ref}').length, 0);
+});
+
+test('commitFiles re-checks preconditions after the branch moves', async () => {
+    // Editor A's delete lands between our first check and our ref update
+    let treeReads = 0;
+    let refAttempts = 0;
+
+    const octokit = fakeGit({
+        overrides: {
+            'GET /repos/{owner}/{repo}/git/trees/{tree_sha}': () => {
+                treeReads += 1;
+                const tree = treeReads === 1 ? [{ path: 'primary.json', sha: 'blob-p', type: 'blob' }] : [];
+                return { data: { tree, truncated: false } };
+            },
+            'PATCH /repos/{owner}/{repo}/git/refs/{ref}': () => {
+                refAttempts += 1;
+                throw conflict();
+            }
+        }
+    });
+
+    await assert.rejects(
+        () => commit(octokit, { preconditions: { present: ['primary.json'] } }),
+        error => error.status === 409 && error.conflicts?.[0]?.reason === 'missing'
+    );
+
+    assert.strictEqual(refAttempts, 1);
+    assert.strictEqual(treeReads, 2);
+});
+
+test('commitFiles refuses to commit when the base tree listing is truncated', async () => {
+    const octokit = fakeGit({
+        overrides: {
+            'GET /repos/{owner}/{repo}/git/trees/{tree_sha}': () => ({ data: { tree: [], truncated: true } })
+        }
+    });
+
+    await assert.rejects(
+        () => commit(octokit, { preconditions: { absent: ['new.json'] } }),
+        error => error.status === 500 && /too large/.test(error.message)
+    );
+
+    assert.strictEqual(octokit.callsTo('POST /repos/{owner}/{repo}/git/trees').length, 0);
+});
+
+test('commitFiles treats every path as absent in a repository with no commits', async () => {
+    const emptyRepo = () => fakeGit({
+        head: { commitSha: null, treeSha: null },
+        overrides: {
+            'PATCH /repos/{owner}/{repo}/git/refs/{ref}': () => { throw conflict(); }
+        }
+    });
+
+    const result = await commit(emptyRepo(), { preconditions: { absent: ['123456789.json'] } });
+    assert.strictEqual(result.commitSha, 'commit-new');
+
+    await assert.rejects(
+        () => commit(emptyRepo(), { preconditions: { present: ['target.json'] } }),
+        error => error.status === 409
+    );
+});
+
+test('commitFiles rejects malformed preconditions', async () => {
+    for (const preconditions of [
+        null,
+        { absent: 'a.json' },
+        { present: [1] },
+        { expected: ['a.json'] },
+        { expected: { 'a.json': 1 } }
+    ]) {
+        await assert.rejects(
+            () => commit(fakeGit(), { preconditions }),
+            error => error.status === 400,
+            `accepted ${JSON.stringify(preconditions)}`
+        );
+    }
 });
