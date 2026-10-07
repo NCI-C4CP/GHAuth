@@ -57,7 +57,7 @@ const validatePreconditions = (preconditions) => {
         throw badRequest('preconditions must be an object');
     }
 
-    const { absent = [], present = [], expected = {} } = preconditions;
+    const { absent = [], present = [], expected = {}, head } = preconditions;
 
     if (!isStringArray(absent) || !isStringArray(present)) {
         throw badRequest('preconditions.absent and preconditions.present must be arrays of paths');
@@ -67,21 +67,34 @@ const validatePreconditions = (preconditions) => {
         !Object.values(expected).every(sha => typeof sha === 'string')) {
         throw badRequest('preconditions.expected must map paths to blob shas');
     }
+
+    if (head !== undefined && typeof head !== 'string') {
+        throw badRequest('preconditions.head must be a commit sha');
+    }
 };
 
 /**
- * Lists what the preconditions got wrong about the base tree, or nothing if they all hold
+ * Lists what the preconditions got wrong about the base commit, or nothing if they all hold
  *
  * Read by tree sha, which is immutable, so GitHub's read-after-write lag cannot apply.
  */
-const findConflicts = async (octokit, owner, repo, baseTreeSha, { absent = [], present = [], expected = {} }) => {
+const findConflicts = async (octokit, owner, repo, base, { absent = [], present = [], expected = {}, head }) => {
+    const conflicts = [];
+
+    // The caller vouched for the whole repository at this commit, not for named files
+    if (head !== undefined && head !== base.commitSha) {
+        conflicts.push({ path: null, reason: 'moved' });
+    }
+
+    if (absent.length + present.length + Object.keys(expected).length === 0) return conflicts;
+
     const shas = new Map();
 
-    if (baseTreeSha) {
+    if (base.treeSha) {
         const response = await octokit.request('GET /repos/{owner}/{repo}/git/trees/{tree_sha}', {
             owner,
             repo,
-            tree_sha: baseTreeSha,
+            tree_sha: base.treeSha,
             headers: { 'X-GitHub-Api-Version': API_VERSION }
         });
 
@@ -94,8 +107,6 @@ const findConflicts = async (octokit, owner, repo, baseTreeSha, { absent = [], p
             if (entry.type === 'blob') shas.set(entry.path, entry.sha);
         }
     }
-
-    const conflicts = [];
 
     for (const path of absent) {
         if (shas.has(path)) conflicts.push({ path, reason: 'exists' });
@@ -116,7 +127,8 @@ const findConflicts = async (octokit, owner, repo, baseTreeSha, { absent = [], p
 const describeConflict = ({ path, reason }) => ({
     exists: `${path} already exists`,
     missing: `${path} no longer exists`,
-    changed: `${path} was changed by someone else`
+    changed: `${path} was changed by someone else`,
+    moved: 'The repository changed after it was checked'
 })[reason];
 
 /**
@@ -134,7 +146,8 @@ const describeConflict = ({ path, reason }) => ({
  * @param {Array<Object>} [params.files=[]] - `{path, content}` entries, content as UTF-8 text
  * @param {Array<string>} [params.deletions=[]] - Paths to remove
  * @param {Object} [params.preconditions] - Must hold at the base commit or nothing is written:
- *   `absent` paths, `present` paths, and `expected` path-to-blob-sha pairs
+ *   `absent` paths, `present` paths, `expected` path-to-blob-sha pairs, and `head`, the
+ *   commit the branch must still point at
  * @returns {Promise<Object>} `{ commitSha, treeSha, files, committed, deleted }`, where
  *   `files` lists each written `{ path, sha, size }`
  * @throws {Error} If validation fails, a precondition fails (409 with `conflicts`), or the
@@ -176,7 +189,7 @@ const commitFiles = async ({ octokit, owner, repo, branch, message, files = [], 
 
         // Re-checked on every attempt: a retry means the base moved and may now violate them
         if (preconditions) {
-            const conflicts = await findConflicts(octokit, owner, repo, baseTreeSha, preconditions);
+            const conflicts = await findConflicts(octokit, owner, repo, { commitSha: baseCommitSha, treeSha: baseTreeSha }, preconditions);
 
             if (conflicts.length > 0) {
                 const error = new Error(`${conflicts.map(describeConflict).join('; ')}. Refresh and try again.`);

@@ -367,7 +367,8 @@ test('commitFiles rejects malformed preconditions', async () => {
         { absent: 'a.json' },
         { present: [1] },
         { expected: ['a.json'] },
-        { expected: { 'a.json': 1 } }
+        { expected: { 'a.json': 1 } },
+        { head: 123 }
     ]) {
         await assert.rejects(
             () => commit(fakeGit(), { preconditions }),
@@ -375,4 +376,65 @@ test('commitFiles rejects malformed preconditions', async () => {
             `accepted ${JSON.stringify(preconditions)}`
         );
     }
+});
+
+test('commitFiles deletes when the branch is still at the commit the caller scanned', async () => {
+    const octokit = fakeGit({ baseTree: [['x.json', 'blob-x']] });
+
+    const result = await commit(octokit, {
+        files: [],
+        deletions: ['x.json'],
+        preconditions: { expected: { 'x.json': 'blob-x' }, head: 'commit-base' }
+    });
+
+    assert.strictEqual(result.deleted, 1);
+});
+
+test('commitFiles skips the tree read when head is the only precondition', async () => {
+    const octokit = fakeGit();
+
+    await commit(octokit, { preconditions: { head: 'commit-base' } });
+
+    assert.strictEqual(octokit.callsTo('GET /repos/{owner}/{repo}/git/trees/{tree_sha}').length, 0);
+});
+
+test('commitFiles rejects without writing when the branch moved past the scanned commit', async () => {
+    const octokit = fakeGit({ baseTree: [['x.json', 'blob-x']] });
+
+    await assert.rejects(
+        () => commit(octokit, {
+            files: [],
+            deletions: ['x.json'],
+            preconditions: { expected: { 'x.json': 'blob-x' }, head: 'commit-scanned' }
+        }),
+        error => {
+            assert.strictEqual(error.status, 409);
+            assert.deepStrictEqual(error.conflicts, [{ path: null, reason: 'moved' }]);
+            return true;
+        }
+    );
+
+    assert.strictEqual(octokit.callsTo('POST /repos/{owner}/{repo}/git/trees').length, 0);
+});
+
+test('commitFiles reports head as moved when a commit lands mid-write', async () => {
+    // The check passes, then another editor's commit wins the ref update
+    let head = 'commit-base';
+
+    const octokit = fakeGit({
+        overrides: {
+            'GET /repos/{owner}/{repo}/git/ref/{ref}': () => ({ data: { object: { sha: head } } }),
+            'PATCH /repos/{owner}/{repo}/git/refs/{ref}': () => {
+                head = 'commit-theirs';
+                throw conflict();
+            }
+        }
+    });
+
+    await assert.rejects(
+        () => commit(octokit, { preconditions: { head: 'commit-base' } }),
+        error => error.status === 409 && error.conflicts?.[0]?.reason === 'moved'
+    );
+
+    assert.strictEqual(octokit.callsTo('PATCH /repos/{owner}/{repo}/git/refs/{ref}').length, 1);
 });
