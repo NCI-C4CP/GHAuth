@@ -26,17 +26,12 @@ const ghauth = async (req, res) => {
     const validEndpoints = [
         'accessToken',
         'getUser',
-        'addFile', 
-        'updateFile',
         'getRepo',
-        'searchFiles',
         'getUserRepositories',
         'getFiles',
-        'deleteFile',
         'getConcept',
         'getConfig',
         'getTree',
-        'getFileContent',
         'commitFiles'
     ];
 
@@ -111,48 +106,6 @@ const ghauth = async (req, res) => {
         }
     }
 
-    if (api === 'addFile') {
-        try {
-            if (req.method !== 'POST') return res.status(405).json({error: 'Method Not Allowed'});
-
-            const token = extractToken(req);
-            if (!token) return sendUnauthorized(res, api, startedAt);
-
-            const missing = missingParams(req.body, ['owner', 'repo', 'path', 'message', 'content']);
-            if (missing.length) return sendMissingParams(res, api, startedAt, missing);
-
-            const octokit = createClient(token);
-
-            const { owner, repo, path, message, content } = req.body;
-
-            // Step 1: Add the new file
-            const response = await octokit.request(`PUT /repos/{owner}/{repo}/contents/{path}`, {
-                owner,
-                repo,
-                path,
-                message,
-                content,
-                headers: {
-                  'X-GitHub-Api-Version': '2022-11-28'
-                }
-            });
-
-            const rateLimit = extractRateLimit(response);
-            logRequest({ api, status: 200, startedAt, rateLimit, commitSha: response.data.commit?.sha, blobSha: response.data.content?.sha });
-            res.status(200).json({
-                data: response.data,
-                // Lets the client re-key its concept cache without re-reading the repository.
-                // Must be the commit SHA: getTree is called with a branch ref and GitHub
-                // answers with the resolved commit, so a tree SHA here would never match.
-                commitSha: response.data.commit?.sha || null,
-                status: response.status,
-                rateLimit
-            });
-        } catch (error) {
-            return sendError(res, api, startedAt, error);
-        }
-    }
-
     if (api === 'commitFiles') {
         try {
             if (req.method !== 'POST') return res.status(405).json({error: 'Method Not Allowed'});
@@ -187,45 +140,6 @@ const ghauth = async (req, res) => {
         }
     }
 
-    if (api === 'updateFile') {
-        try {
-            if (req.method !== 'POST') return res.status(405).json({error: 'Method Not Allowed'});
-
-            const token = extractToken(req);
-            if (!token) return sendUnauthorized(res, api, startedAt);
-
-            const missing = missingParams(req.body, ['owner', 'repo', 'path', 'message', 'content', 'sha']);
-            if (missing.length) return sendMissingParams(res, api, startedAt, missing);
-
-            const octokit = createClient(token);
-
-            const { owner, repo, path, message, content, sha } = req.body;
-
-            const response = await octokit.request(`PUT /repos/{owner}/{repo}/contents/{path}`, {
-                owner,
-                repo,
-                path,
-                message,
-                content,
-                sha,
-                headers: {
-                  'X-GitHub-Api-Version': '2022-11-28'
-                }
-            });
-
-            const rateLimit = extractRateLimit(response);
-            logRequest({ api, status: 200, startedAt, rateLimit, commitSha: response.data.commit?.sha, blobSha: response.data.content?.sha });
-            res.status(200).json({
-                data: response.data,
-                commitSha: response.data.commit?.sha || null,
-                status: response.status,
-                rateLimit
-            });
-        } catch (error) {
-            return sendError(res, api, startedAt, error);
-        }
-    }
-
     if (api === 'getRepo') {
         try {
             if (req.method !== 'GET') return res.status(405).json({error: 'Method Not Allowed'});
@@ -255,66 +169,6 @@ const ghauth = async (req, res) => {
             logRequest({ api, status: 200, startedAt, rateLimit: extractRateLimit(response), bytes: zipData.length });
             res.set('Content-Type', 'application/zip');
             res.status(200).send(zipData);
-        } catch (error) {
-            return sendError(res, api, startedAt, error);
-        }
-    }
-
-    if (api === 'searchFiles') {
-        try {
-            if (req.method !== 'GET') return res.status(405).json({error: 'Method Not Allowed'});
-
-            const token = extractToken(req);
-            if (!token) return sendUnauthorized(res, api, startedAt);
-
-            const missing = missingParams(req.query, ['owner', 'repo', 'query']);
-            if (missing.length) return sendMissingParams(res, api, startedAt, missing);
-
-            const { owner, repo, query } = req.query;
-
-            const octokit = createClient(token);
-
-            // Use GitHub Search API to find JSON files containing the query term
-            const searchQuery = `${query} in:file extension:json repo:${owner}/${repo}`;
-            
-            const searchResponse = await octokit.request('GET /search/code', {
-                q: searchQuery,
-                per_page: 100, // Maximum allowed by GitHub
-                headers: {
-                    'X-GitHub-Api-Version': '2022-11-28'
-                }
-            });
-
-            // Filter out reference/index files and extract file paths and relevant information
-            const matchingFiles = searchResponse.data.items
-                .filter(item => {
-                    // Exclude index.json and config.json files
-                    const fileName = item.name.toLowerCase();
-                    const queryFileName = `${query.toLowerCase()}.json`;
-
-                    return !['index.json', 'config.json'].includes(fileName) &&
-                           fileName !== queryFileName; // Exclude the file that matches the query itself
-                })
-                .map(item => ({
-                    path: item.path,
-                    name: item.name,
-                    sha: item.sha,
-                    url: item.html_url,
-                    score: item.score,
-                    repository: item.repository.full_name
-                }));
-
-            const rateLimit = extractRateLimit(searchResponse, 30); // Search API limit is 30/min
-
-            logRequest({ api, status: 200, startedAt, rateLimit });
-            res.status(200).json({
-                query: query,
-                totalCount: searchResponse.data.total_count,
-                incomplete_results: searchResponse.data.incomplete_results,
-                files: matchingFiles,
-                rateLimit
-            });
-
         } catch (error) {
             return sendError(res, api, startedAt, error);
         }
@@ -391,44 +245,6 @@ const ghauth = async (req, res) => {
                 });
             }
 
-            return sendError(res, api, startedAt, error);
-        }
-    }
-
-    if (api === 'deleteFile') {
-        try {
-            if (req.method !== 'POST') return res.status(405).json({error: 'Method Not Allowed'});
-
-            const token = extractToken(req);
-            if (!token) return sendUnauthorized(res, api, startedAt);
-
-            const missing = missingParams(req.body, ['owner', 'repo', 'path', 'message', 'sha']);
-            if (missing.length) return sendMissingParams(res, api, startedAt, missing);
-
-            const octokit = createClient(token);
-
-            const { owner, repo, path, message, sha } = req.body;
-
-            const response = await octokit.request(`DELETE /repos/{owner}/{repo}/contents/{path}`, {
-                owner,
-                repo,
-                path,
-                message,
-                sha,
-                headers: {
-                  'X-GitHub-Api-Version': '2022-11-28'
-                }
-            });
-
-            const rateLimit = extractRateLimit(response);
-            logRequest({ api, status: 200, startedAt, rateLimit, commitSha: response.data.commit?.sha, blobSha: sha });
-            res.status(200).json({
-                data: response.data,
-                commitSha: response.data.commit?.sha || null,
-                status: response.status,
-                rateLimit
-            });
-        } catch (error) {
             return sendError(res, api, startedAt, error);
         }
     }
@@ -568,42 +384,6 @@ const ghauth = async (req, res) => {
                 return res.status(200).json({ data: [], sha: null, truncated: false, status: 200 });
             }
 
-            return sendError(res, api, startedAt, error);
-        }
-    }
-
-    if (api === 'getFileContent') {
-        try {
-            if (req.method !== 'GET') return res.status(405).json({error: 'Method Not Allowed'});
-
-            const token = extractToken(req);
-            if (!token) return sendUnauthorized(res, api, startedAt);
-
-            const missing = missingParams(req.query, ['owner', 'repo', 'path']);
-            if (missing.length) return sendMissingParams(res, api, startedAt, missing);
-
-            const { owner, repo, path } = req.query;
-
-            // The raw media type reads up to 100MB. The default JSON representation
-            // returns content:"" above 1MB with a 200, which is indistinguishable from an empty file.
-            const response = await createClient(token).request('GET /repos/{owner}/{repo}/contents/{path}', {
-                owner,
-                repo,
-                path,
-                headers: {
-                    'X-GitHub-Api-Version': API_VERSION,
-                    accept: 'application/vnd.github.raw'
-                }
-            });
-
-            const rateLimit = extractRateLimit(response);
-            logRequest({ api, status: 200, startedAt, rateLimit });
-            res.status(200).json({
-                content: typeof response.data === 'string' ? response.data : JSON.stringify(response.data),
-                status: response.status,
-                rateLimit
-            });
-        } catch (error) {
             return sendError(res, api, startedAt, error);
         }
     }

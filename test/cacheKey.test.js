@@ -42,11 +42,27 @@ const fakeGitHub = () => {
     const head = { commit: 'commit-1', tree: 'tree-1' };
 
     return {
-        request: async (route) => {
-            if (route.endsWith('/contents/{path}') && !route.startsWith('GET')) {
-                head.commit = 'commit-2';
+        request: async (route, options) => {
+            if (route === 'GET /repos/{owner}/{repo}/git/ref/{ref}') {
+                return { status: 200, headers: {}, data: { object: { sha: head.commit } } };
+            }
+
+            if (route === 'GET /repos/{owner}/{repo}/git/commits/{commit_sha}') {
+                return { status: 200, headers: {}, data: { tree: { sha: head.tree } } };
+            }
+
+            if (route === 'POST /repos/{owner}/{repo}/git/trees') {
+                return { status: 201, headers: {}, data: { sha: 'tree-2' } };
+            }
+
+            if (route === 'POST /repos/{owner}/{repo}/git/commits') {
+                return { status: 201, headers: {}, data: { sha: 'commit-2' } };
+            }
+
+            if (route === 'PATCH /repos/{owner}/{repo}/git/refs/{ref}') {
+                head.commit = options.sha;
                 head.tree = 'tree-2';
-                return { status: 200, headers: {}, data: { commit: { sha: head.commit, tree: { sha: head.tree } } } };
+                return { status: 200, headers: {}, data: {} };
             }
 
             if (route === 'GET /repos/{owner}/{repo}/git/trees/{tree_sha}') {
@@ -66,20 +82,21 @@ const currentTreeSha = async () => {
     return res.body.sha;
 };
 
+// Every write goes through commitFiles, so this covers adds, edits, deletes and imports
 const WRITES = [
-    { api: 'addFile',    body: { ...REPO, path: 'a.json', message: 'm', content: 'e30=' } },
-    { api: 'updateFile', body: { ...REPO, path: 'a.json', message: 'm', content: 'e30=', sha: 'blob-sha' } },
-    { api: 'deleteFile', body: { ...REPO, path: 'a.json', message: 'm', sha: 'blob-sha' } }
+    { label: 'a file write', body: { files: [{ path: 'a.json', content: '{}' }] } },
+    { label: 'a deletion', body: { deletions: ['a.json'] } }
 ];
 
-for (const { api, body } of WRITES) {
-    test(`${api} reports the same SHA getTree reports afterwards`, async () => {
+for (const { label, body } of WRITES) {
+    test(`commitFiles reports the same SHA getTree reports after ${label}`, async () => {
         client = fakeGitHub();
 
-        const res = await call({ method: 'POST', api, body });
+        const res = await call({ method: 'POST', api: 'commitFiles', body: { ...REPO, branch: 'main', message: 'm', ...body } });
         assert.strictEqual(res.statusCode, 200);
 
-        assert.ok(res.body.commitSha, `${api} must return a commitSha for the client cache`);
+        assert.ok(res.body.commitSha, 'commitFiles must return a commitSha for the client cache');
+        assert.notStrictEqual(res.body.commitSha, res.body.treeSha);
         assert.strictEqual(res.body.commitSha, await currentTreeSha());
     });
 }

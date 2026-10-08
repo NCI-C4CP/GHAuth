@@ -42,17 +42,12 @@ const AUTH = { authorization: 'Bearer fake-token-not-sent-anywhere' };
 const ENDPOINTS = [
     { api: 'accessToken',         method: 'POST', auth: false, requires: ['code', 'redirect'],                        in: 'body' },
     { api: 'getUser',             method: 'GET',  auth: true,  requires: [] },
-    { api: 'addFile',             method: 'POST', auth: true,  requires: ['owner', 'repo', 'path', 'message', 'content'],        in: 'body' },
-    { api: 'updateFile',          method: 'POST', auth: true,  requires: ['owner', 'repo', 'path', 'message', 'content', 'sha'], in: 'body' },
     { api: 'getRepo',             method: 'GET',  auth: true,  requires: ['owner', 'repo'],                           in: 'query' },
-    { api: 'searchFiles',         method: 'GET',  auth: true,  requires: ['owner', 'repo', 'query'],                  in: 'query' },
     { api: 'getUserRepositories', method: 'GET',  auth: true,  requires: [] },
     { api: 'getFiles',            method: 'GET',  auth: true,  requires: ['owner', 'repo', 'path'],                   in: 'query' },
-    { api: 'deleteFile',          method: 'POST', auth: true,  requires: ['owner', 'repo', 'path', 'message', 'sha'], in: 'body' },
     { api: 'getConcept',          method: 'GET',  auth: true,  requires: ['owner', 'repo'],                            in: 'query' },
     { api: 'getConfig',           method: 'GET',  auth: true,  requires: ['owner', 'repo', 'path'],                   in: 'query' },
     { api: 'getTree',             method: 'GET',  auth: true,  requires: ['owner', 'repo', 'ref'],                    in: 'query' },
-    { api: 'getFileContent',      method: 'GET',  auth: true,  requires: ['owner', 'repo', 'path'],                   in: 'query' },
     { api: 'commitFiles',         method: 'POST', auth: true,  requires: ['owner', 'repo', 'branch', 'message'],      in: 'body' }
 ];
 
