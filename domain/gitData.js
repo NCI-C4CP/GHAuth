@@ -184,17 +184,29 @@ const commitFiles = async ({ octokit, owner, repo, branch, message, files = [], 
 
     let lastConflict = null;
 
+    // Milliseconds per GitHub step, summed across retries, so slow saves can be attributed
+    const timings = {};
+    const timed = async (step, run) => {
+        const started = Date.now();
+        try {
+            return await run();
+        } finally {
+            timings[step] = (timings[step] || 0) + Date.now() - started;
+        }
+    };
+
     for (let attempt = 0; attempt < MAX_REF_RETRIES; attempt++) {
-        const { commitSha: baseCommitSha, treeSha: baseTreeSha } = await readBranchHead(octokit, owner, repo, branch);
+        const { commitSha: baseCommitSha, treeSha: baseTreeSha } = await timed('head', () => readBranchHead(octokit, owner, repo, branch));
 
         // Re-checked on every attempt: a retry means the base moved and may now violate them
         if (preconditions) {
-            const conflicts = await findConflicts(octokit, owner, repo, { commitSha: baseCommitSha, treeSha: baseTreeSha }, preconditions);
+            const conflicts = await timed('check', () => findConflicts(octokit, owner, repo, { commitSha: baseCommitSha, treeSha: baseTreeSha }, preconditions));
 
             if (conflicts.length > 0) {
                 const error = new Error(`${conflicts.map(describeConflict).join('; ')}. Refresh and try again.`);
                 error.status = 409;
                 error.conflicts = conflicts;
+                error.timings = timings;
                 throw error;
             }
         }
@@ -208,34 +220,34 @@ const commitFiles = async ({ octokit, owner, repo, branch, message, files = [], 
             tree.push({ path, mode: BLOB_MODE, type: 'blob', sha: null });
         }
 
-        const createdTree = await octokit.request('POST /repos/{owner}/{repo}/git/trees', {
+        const createdTree = await timed('tree', () => octokit.request('POST /repos/{owner}/{repo}/git/trees', {
             owner,
             repo,
             tree,
             ...(baseTreeSha ? { base_tree: baseTreeSha } : {}),
             headers: { 'X-GitHub-Api-Version': API_VERSION }
-        });
+        }));
 
-        const createdCommit = await octokit.request('POST /repos/{owner}/{repo}/git/commits', {
+        const createdCommit = await timed('commit', () => octokit.request('POST /repos/{owner}/{repo}/git/commits', {
             owner,
             repo,
             message,
             tree: createdTree.data.sha,
             parents: baseCommitSha ? [baseCommitSha] : [],
             headers: { 'X-GitHub-Api-Version': API_VERSION }
-        });
+        }));
 
         let refResponse;
 
         try {
-            refResponse = await octokit.request('PATCH /repos/{owner}/{repo}/git/refs/{ref}', {
+            refResponse = await timed('ref', () => octokit.request('PATCH /repos/{owner}/{repo}/git/refs/{ref}', {
                 owner,
                 repo,
                 ref: `heads/${branch}`,
                 sha: createdCommit.data.sha,
                 force: false,
                 headers: { 'X-GitHub-Api-Version': API_VERSION }
-            });
+            }));
         } catch (error) {
             // Non-fast-forward: another commit landed since this attempt read the head
             if (error.status === 422 && baseCommitSha) {
@@ -268,6 +280,8 @@ const commitFiles = async ({ octokit, owner, repo, branch, message, files = [], 
             committed: files.length,
             deleted: deletions.length,
             writes: WRITES_PER_COMMIT,
+            attempts: attempt + 1,
+            timings,
             lastResponse: refResponse
         };
     }
@@ -275,6 +289,7 @@ const commitFiles = async ({ octokit, owner, repo, branch, message, files = [], 
     const error = new Error('The branch moved while this batch was being written. Retry the operation.');
     error.status = 409;
     error.cause = lastConflict;
+    error.timings = timings;
     throw error;
 };
 

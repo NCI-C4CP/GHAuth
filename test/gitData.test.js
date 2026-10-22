@@ -99,6 +99,14 @@ test('commitFiles returns the new commit and the write cost', async () => {
     assert.strictEqual(result.writes, WRITES_PER_COMMIT);
 });
 
+test('commitFiles times each GitHub step so slow saves can be attributed', async () => {
+    const result = await commit(fakeGit({ baseTree: [] }), { preconditions: { absent: ['123456789.json'] } });
+
+    assert.deepStrictEqual(Object.keys(result.timings).sort(), ['check', 'commit', 'head', 'ref', 'tree']);
+    assert.ok(Object.values(result.timings).every(ms => Number.isInteger(ms) && ms >= 0));
+    assert.strictEqual(result.attempts, 1);
+});
+
 test('commitFiles never returns the raw ref response to the caller of the API layer', async () => {
     const result = await commit(fakeGit());
 
