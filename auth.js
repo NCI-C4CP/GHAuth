@@ -120,7 +120,7 @@ const ghauth = async (req, res) => {
 
             const { owner, repo, branch, message, files, deletions, preconditions } = req.body;
 
-            const { lastResponse, timings, attempts, ...result } = await commitFiles({
+            const { timings, attempts, rateLimit, ...result } = await commitFiles({
                 octokit,
                 owner,
                 repo,
@@ -130,8 +130,6 @@ const ghauth = async (req, res) => {
                 deletions: deletions || [],
                 preconditions
             });
-
-            const rateLimit = extractRateLimit(lastResponse);
 
             logRequest({ api, status: 200, startedAt, rateLimit, files: result.committed, deleted: result.deleted, writes: result.writes, attempts, timings });
             res.status(200).json({ ...result, status: 200, rateLimit });

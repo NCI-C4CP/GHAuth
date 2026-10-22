@@ -3,45 +3,65 @@ const assert = require('node:assert');
 
 const { commitFiles, blobSha, MAX_ENTRIES_PER_COMMIT, WRITES_PER_COMMIT } = require('../domain/gitData');
 
-const notFound = () => Object.assign(new Error('Not Found'), { status: 404 });
-const conflict = () => Object.assign(new Error('Update is not a fast forward'), { status: 422 });
+const conflict = () => Object.assign(new Error('Reference already exists'), { status: 422 });
+const stale = () => Object.assign(new Error('Expected branch to point to "commit-base" but it did not.'), {
+    errors: [{ type: 'STALE_DATA', path: ['createCommitOnBranch'], message: 'Expected branch to point to "commit-base" but it did not.' }]
+});
 
 /**
- * Route-aware stand-in for octokit. Each handler may be overridden per test, and
- * every call is recorded so the resulting tree and commit can be asserted.
+ * Stand-in for octokit. GraphQL reads answer from `head` and `baseTree` the way GitHub does,
+ * including a NOT_FOUND per missing path; tests may mutate both mid-run. Every call is recorded.
  */
 const fakeGit = ({ head = { commitSha: 'commit-base', treeSha: 'tree-base' }, baseTree = [], overrides = {} } = {}) => {
     const calls = [];
 
     const handlers = {
-        'GET /repos/{owner}/{repo}/git/ref/{ref}': () => {
-            if (!head.commitSha) throw notFound();
-            return { data: { object: { sha: head.commitSha } } };
+        read: ({ variables }) => {
+            const rateLimit = { limit: 5000, remaining: 4999, used: 1, resetAt: '2030-01-01T00:00:00Z' };
+            if (!head.commitSha) return { rateLimit, repository: { ref: null } };
+
+            const target = { oid: head.commitSha, tree: { oid: head.treeSha } };
+            const errors = [];
+
+            for (const [name, path] of Object.entries(variables)) {
+                if (!/^p\d+$/.test(name)) continue;
+
+                const alias = `f${name.slice(1)}`;
+                const entry = baseTree.find(([candidate]) => candidate === path);
+
+                target[alias] = entry ? { oid: entry[1] } : null;
+                if (!entry) errors.push({ type: 'NOT_FOUND', path: ['repository', 'ref', 'target', alias], message: `Could not resolve file for path '${path}'.` });
+            }
+
+            const data = { rateLimit, repository: { ref: { target } } };
+            if (errors.length > 0) throw Object.assign(new Error('Request failed due to following response errors'), { errors, data });
+            return data;
         },
-        'GET /repos/{owner}/{repo}/git/commits/{commit_sha}': () => ({ data: { tree: { sha: head.treeSha } } }),
+        commit: () => ({ createCommitOnBranch: { commit: { oid: 'commit-new', tree: { oid: 'tree-new' } } } }),
         'GET /repos/{owner}/{repo}/git/trees/{tree_sha}': () => ({
             data: { tree: baseTree.map(([path, sha]) => ({ path, sha, type: 'blob' })), truncated: false }
         }),
-        // Recorded so a reintroduced index round-trip would show up as a call
-        'GET /repos/{owner}/{repo}/contents/{path}': () => { throw notFound(); },
         'POST /repos/{owner}/{repo}/git/trees': () => ({ data: { sha: 'tree-new' } }),
         'POST /repos/{owner}/{repo}/git/commits': () => ({ data: { sha: 'commit-new' } }),
-        'PATCH /repos/{owner}/{repo}/git/refs/{ref}': () => ({ data: { ref: 'refs/heads/main' } }),
         'POST /repos/{owner}/{repo}/git/refs': () => ({ data: { ref: 'refs/heads/main' } }),
         ...overrides
     };
 
+    const call = async (route, options) => {
+        calls.push({ route, options });
+
+        const handler = handlers[route];
+        if (!handler) throw new Error(`Unexpected route: ${route}`);
+
+        return handler(options, calls);
+    };
+
     return {
         calls,
-        callsTo: (route) => calls.filter(call => call.route === route),
-        request: async (route, options) => {
-            calls.push({ route, options });
-
-            const handler = handlers[route];
-            if (!handler) throw new Error(`Unexpected route: ${route}`);
-
-            return handler(options, calls);
-        }
+        callsTo: (route) => calls.filter(entry => entry.route === route),
+        restCalls: () => calls.filter(entry => entry.route !== 'read' && entry.route !== 'commit'),
+        request: (route, options) => call(route, options),
+        graphql: (query, variables) => call(query.includes('createCommitOnBranch') ? 'commit' : 'read', { query, variables })
     };
 };
 
@@ -102,35 +122,53 @@ test('commitFiles returns the new commit and the write cost', async () => {
 test('commitFiles times each GitHub step so slow saves can be attributed', async () => {
     const result = await commit(fakeGit({ baseTree: [] }), { preconditions: { absent: ['123456789.json'] } });
 
-    assert.deepStrictEqual(Object.keys(result.timings).sort(), ['check', 'commit', 'head', 'ref', 'tree']);
+    assert.deepStrictEqual(Object.keys(result.timings).sort(), ['check', 'read', 'write']);
     assert.ok(Object.values(result.timings).every(ms => Number.isInteger(ms) && ms >= 0));
     assert.strictEqual(result.attempts, 1);
 });
 
-test('commitFiles never returns the raw ref response to the caller of the API layer', async () => {
-    const result = await commit(fakeGit());
+test('commitFiles reports the GraphQL rate limit in the shape the client reads', async () => {
+    const { rateLimit } = await commit(fakeGit());
 
-    // auth.js strips lastResponse; it exists only so rate limit headers can be read
-    assert.ok(result.lastResponse, 'lastResponse should be present for rate limit extraction');
+    assert.strictEqual(rateLimit.resource, 'graphql');
+    assert.strictEqual(rateLimit.limit, 5000);
+    assert.strictEqual(rateLimit.remaining, 4999);
+    assert.ok(rateLimit.reset instanceof Date);
 });
 
-test('commitFiles writes only the given files into the tree', async () => {
-    const octokit = fakeGit();
-    await commit(octokit);
+test('commitFiles saves with one GraphQL read, one GraphQL write and no REST calls', async () => {
+    const octokit = fakeGit({ baseTree: [['123456789.json', 'blob-1']] });
 
-    const [treeCall] = octokit.callsTo('POST /repos/{owner}/{repo}/git/trees');
-    const paths = treeCall.options.tree.map(entry => entry.path);
+    await commit(octokit, { preconditions: { expected: { '123456789.json': 'blob-1' } } });
 
-    assert.deepStrictEqual(paths, ['123456789.json']);
-    assert.strictEqual(treeCall.options.base_tree, 'tree-base');
+    assert.strictEqual(octokit.callsTo('read').length, 1);
+    assert.strictEqual(octokit.callsTo('commit').length, 1);
+    assert.deepStrictEqual(octokit.restCalls(), []);
 });
 
-test('commitFiles never reads index.json', async () => {
-    const octokit = fakeGit();
-    await commit(octokit);
+const commitInput = (octokit, n = 0) => octokit.callsTo('commit')[n].options.variables.input;
 
-    // The index round-trip was the bulk of save latency; it must not come back
-    assert.strictEqual(octokit.callsTo('GET /repos/{owner}/{repo}/contents/{path}').length, 0);
+const lookedUp = (octokit, n = 0) => Object.entries(octokit.callsTo('read')[n].options.variables)
+    .filter(([name]) => /^p\d+$/.test(name))
+    .map(([, path]) => path);
+
+test('commitFiles commits only the given files, as base64, on top of the head it read', async () => {
+    const octokit = fakeGit();
+    await commit(octokit, { files: [{ path: '123456789.json', content: '{"key":"café"}' }] });
+
+    const input = commitInput(octokit);
+
+    assert.strictEqual(input.expectedHeadOid, 'commit-base');
+    assert.deepStrictEqual(input.branch, { repositoryNameWithOwner: 'o/r', branchName: 'main' });
+    assert.deepStrictEqual(input.fileChanges.additions.map(addition => addition.path), ['123456789.json']);
+    assert.strictEqual(Buffer.from(input.fileChanges.additions[0].contents, 'base64').toString('utf8'), '{"key":"café"}');
+});
+
+test('commitFiles splits the message into a headline and body', async () => {
+    const octokit = fakeGit();
+    await commit(octokit, { message: 'Edit concept "alpha"\n\nChanged the description' });
+
+    assert.deepStrictEqual(commitInput(octokit).message, { headline: 'Edit concept "alpha"', body: 'Changed the description' });
 });
 
 test('commitFiles skips a caller-supplied index.json so a stale copy is not rewritten', async () => {
@@ -143,21 +181,15 @@ test('commitFiles skips a caller-supplied index.json so a stale copy is not rewr
         ]
     });
 
-    const [treeCall] = octokit.callsTo('POST /repos/{owner}/{repo}/git/trees');
-    const paths = treeCall.options.tree.map(entry => entry.path);
-
-    assert.deepStrictEqual(paths, ['1.json']);
+    assert.deepStrictEqual(commitInput(octokit).fileChanges.additions.map(addition => addition.path), ['1.json']);
 });
 
-test('commitFiles marks deletions with a null sha', async () => {
+test('commitFiles sends deletions as paths', async () => {
     const octokit = fakeGit();
 
     const result = await commit(octokit, { files: [], deletions: ['1.json'] });
 
-    const [treeCall] = octokit.callsTo('POST /repos/{owner}/{repo}/git/trees');
-    const deletion = treeCall.options.tree.find(entry => entry.path === '1.json');
-
-    assert.strictEqual(deletion.sha, null);
+    assert.deepStrictEqual(commitInput(octokit).fileChanges, { additions: [], deletions: [{ path: '1.json' }] });
     assert.strictEqual(result.deleted, 1);
 });
 
@@ -165,23 +197,18 @@ test('commitFiles commits a file that is not valid JSON without inspecting it', 
     const octokit = fakeGit();
     await commit(octokit, { files: [{ path: 'broken.json', content: 'not json' }] });
 
-    const [treeCall] = octokit.callsTo('POST /repos/{owner}/{repo}/git/trees');
-    const paths = treeCall.options.tree.map(entry => entry.path);
-
-    assert.ok(paths.includes('broken.json'));
+    assert.deepStrictEqual(commitInput(octokit).fileChanges.additions.map(addition => addition.path), ['broken.json']);
 });
 
-test('commitFiles creates the ref on a repository with no commits', async () => {
-    const octokit = fakeGit({
-        head: { commitSha: null, treeSha: null },
-        overrides: {
-            'PATCH /repos/{owner}/{repo}/git/refs/{ref}': () => { throw conflict(); }
-        }
-    });
+test('commitFiles builds the first commit of an empty repository over REST', async () => {
+    // createCommitOnBranch needs a branch to exist
+    const octokit = fakeGit({ head: { commitSha: null, treeSha: null } });
 
     const result = await commit(octokit);
 
     assert.strictEqual(result.commitSha, 'commit-new');
+    assert.strictEqual(result.writes, 3);
+    assert.strictEqual(octokit.callsTo('commit').length, 0);
     assert.strictEqual(octokit.callsTo('POST /repos/{owner}/{repo}/git/refs').length, 1);
 
     const [commitCall] = octokit.callsTo('POST /repos/{owner}/{repo}/git/commits');
@@ -191,15 +218,41 @@ test('commitFiles creates the ref on a repository with no commits', async () => 
     assert.strictEqual(treeCall.options.base_tree, undefined);
 });
 
-test('commitFiles retries when the branch moves and succeeds on a later attempt', async () => {
-    let attempts = 0;
+test('commitFiles retries when another editor makes the first commit at the same time', async () => {
+    const head = { commitSha: null, treeSha: null };
 
     const octokit = fakeGit({
+        head,
         overrides: {
-            'PATCH /repos/{owner}/{repo}/git/refs/{ref}': () => {
-                attempts += 1;
-                if (attempts === 1) throw conflict();
-                return { data: { ref: 'refs/heads/main' } };
+            'POST /repos/{owner}/{repo}/git/refs': () => {
+                Object.assign(head, { commitSha: 'commit-theirs', treeSha: 'tree-theirs' });
+                throw conflict();
+            }
+        }
+    });
+
+    const result = await commit(octokit);
+
+    assert.strictEqual(result.attempts, 2);
+    assert.strictEqual(commitInput(octokit).expectedHeadOid, 'commit-theirs');
+});
+
+test('commitFiles retries when the branch moves and succeeds on a later attempt', async () => {
+    const head = { commitSha: 'commit-base', treeSha: 'tree-base' };
+    let writes = 0;
+
+    const octokit = fakeGit({
+        head,
+        overrides: {
+            commit: () => {
+                writes += 1;
+
+                if (writes === 1) {
+                    head.commitSha = 'commit-theirs';
+                    throw stale();
+                }
+
+                return { createCommitOnBranch: { commit: { oid: 'commit-new', tree: { oid: 'tree-new' } } } };
             }
         }
     });
@@ -207,36 +260,57 @@ test('commitFiles retries when the branch moves and succeeds on a later attempt'
     const result = await commit(octokit);
 
     assert.strictEqual(result.commitSha, 'commit-new');
-    assert.strictEqual(attempts, 2);
+    assert.strictEqual(result.attempts, 2);
     // Each attempt re-reads the branch head, since a competing commit moved it
-    assert.strictEqual(octokit.callsTo('GET /repos/{owner}/{repo}/git/ref/{ref}').length, 2);
+    assert.strictEqual(octokit.callsTo('read').length, 2);
+    assert.deepStrictEqual(
+        octokit.callsTo('commit').map(entry => entry.options.variables.input.expectedHeadOid),
+        ['commit-base', 'commit-theirs']
+    );
 });
 
 test('commitFiles gives up with a 409 when the branch keeps moving', async () => {
-    const octokit = fakeGit({
-        overrides: {
-            'PATCH /repos/{owner}/{repo}/git/refs/{ref}': () => { throw conflict(); }
-        }
-    });
+    const octokit = fakeGit({ overrides: { commit: () => { throw stale(); } } });
 
     await assert.rejects(
         () => commit(octokit),
         error => error.status === 409 && /branch moved/.test(error.message)
     );
 
-    assert.strictEqual(octokit.callsTo('PATCH /repos/{owner}/{repo}/git/refs/{ref}').length, 3);
+    assert.strictEqual(octokit.callsTo('commit').length, 3);
 });
 
-test('commitFiles propagates a ref failure that is not a conflict', async () => {
+test('commitFiles propagates a write failure that is not a conflict', async () => {
     const octokit = fakeGit({
         overrides: {
-            'PATCH /repos/{owner}/{repo}/git/refs/{ref}': () => {
-                throw Object.assign(new Error('Server Error'), { status: 500 });
-            }
+            commit: () => { throw Object.assign(new Error('Server Error'), { status: 500 }); }
         }
     });
 
     await assert.rejects(() => commit(octokit), error => error.status === 500);
+    assert.strictEqual(octokit.callsTo('commit').length, 1);
+});
+
+test('commitFiles gives GraphQL errors the HTTP status the API layer reports', async () => {
+    const graphqlError = (type) => Object.assign(new Error(type), { errors: [{ type, message: `${type} message` }] });
+
+    const forbidden = fakeGit({ overrides: { commit: () => { throw graphqlError('FORBIDDEN'); } } });
+    await assert.rejects(() => commit(forbidden), error => error.status === 403 && error.message === 'FORBIDDEN message');
+
+    // A missing repository is not a missing path, so it must not read as "absent"
+    const noRepo = fakeGit({
+        overrides: {
+            read: () => {
+                throw Object.assign(new Error('Could not resolve to a Repository'), {
+                    errors: [{ type: 'NOT_FOUND', path: ['repository'], message: 'Could not resolve to a Repository' }],
+                    data: { repository: null }
+                });
+            }
+        }
+    });
+
+    await assert.rejects(() => commit(noRepo, { preconditions: { absent: ['a.json'] } }), error => error.status === 404);
+    assert.strictEqual(noRepo.callsTo('commit').length, 0);
 });
 
 test('blobSha matches git hash-object, counting bytes rather than characters', () => {
@@ -253,11 +327,12 @@ test('commitFiles returns the blob sha and size of each written file', async () 
     ]);
 });
 
-test('commitFiles skips the base tree read when there are no preconditions', async () => {
+test('commitFiles looks up no paths when there are no preconditions', async () => {
     const octokit = fakeGit();
     await commit(octokit);
 
-    assert.strictEqual(octokit.callsTo('GET /repos/{owner}/{repo}/git/trees/{tree_sha}').length, 0);
+    assert.deepStrictEqual(lookedUp(octokit), []);
+    assert.deepStrictEqual(octokit.restCalls(), []);
 });
 
 test('commitFiles commits when every precondition holds', async () => {
@@ -276,9 +351,8 @@ test('commitFiles commits when every precondition holds', async () => {
     });
 
     assert.strictEqual(result.commitSha, 'commit-new');
-
-    const [treeRead] = octokit.callsTo('GET /repos/{owner}/{repo}/git/trees/{tree_sha}');
-    assert.strictEqual(treeRead.options.tree_sha, 'tree-base');
+    assert.deepStrictEqual(lookedUp(octokit).sort(), ['edited.json', 'new.json', 'target.json']);
+    assert.deepStrictEqual(octokit.restCalls(), []);
 });
 
 test('commitFiles rejects each kind of failed precondition without writing anything', async () => {
@@ -305,25 +379,22 @@ test('commitFiles rejects each kind of failed precondition without writing anyth
         }
     );
 
-    assert.strictEqual(octokit.callsTo('POST /repos/{owner}/{repo}/git/trees').length, 0);
-    assert.strictEqual(octokit.callsTo('PATCH /repos/{owner}/{repo}/git/refs/{ref}').length, 0);
+    assert.strictEqual(octokit.callsTo('commit').length, 0);
 });
 
 test('commitFiles re-checks preconditions after the branch moves', async () => {
-    // Editor A's delete lands between our first check and our ref update
-    let treeReads = 0;
-    let refAttempts = 0;
+    // Editor A's delete lands between our check and our write
+    const head = { commitSha: 'commit-base', treeSha: 'tree-base' };
+    const baseTree = [['primary.json', 'blob-p']];
 
     const octokit = fakeGit({
+        head,
+        baseTree,
         overrides: {
-            'GET /repos/{owner}/{repo}/git/trees/{tree_sha}': () => {
-                treeReads += 1;
-                const tree = treeReads === 1 ? [{ path: 'primary.json', sha: 'blob-p', type: 'blob' }] : [];
-                return { data: { tree, truncated: false } };
-            },
-            'PATCH /repos/{owner}/{repo}/git/refs/{ref}': () => {
-                refAttempts += 1;
-                throw conflict();
+            commit: () => {
+                head.commitSha = 'commit-theirs';
+                baseTree.length = 0;
+                throw stale();
             }
         }
     });
@@ -333,11 +404,35 @@ test('commitFiles re-checks preconditions after the branch moves', async () => {
         error => error.status === 409 && error.conflicts?.[0]?.reason === 'missing'
     );
 
-    assert.strictEqual(refAttempts, 1);
-    assert.strictEqual(treeReads, 2);
+    assert.strictEqual(octokit.callsTo('commit').length, 1);
+    assert.strictEqual(octokit.callsTo('read').length, 2);
 });
 
-test('commitFiles refuses to commit when the base tree listing is truncated', async () => {
+const manyPaths = (count) => Array.from({ length: count }, (_, i) => `${i}.json`);
+
+test('commitFiles checks more than 100 paths against the whole tree instead of one lookup each', async () => {
+    const octokit = fakeGit({ baseTree: [['5.json', 'blob-5']] });
+
+    await assert.rejects(
+        () => commit(octokit, { preconditions: { absent: manyPaths(101) } }),
+        error => error.status === 409 && error.conflicts.length === 1 && error.conflicts[0].path === '5.json'
+    );
+
+    assert.deepStrictEqual(lookedUp(octokit), []);
+
+    const [treeRead] = octokit.callsTo('GET /repos/{owner}/{repo}/git/trees/{tree_sha}');
+    assert.strictEqual(treeRead.options.tree_sha, 'tree-base');
+});
+
+test('commitFiles looks up as many as 100 paths in the query itself', async () => {
+    const octokit = fakeGit();
+    await commit(octokit, { preconditions: { absent: manyPaths(100) } });
+
+    assert.strictEqual(lookedUp(octokit).length, 100);
+    assert.deepStrictEqual(octokit.restCalls(), []);
+});
+
+test('commitFiles refuses to commit when the fallback tree listing is truncated', async () => {
     const octokit = fakeGit({
         overrides: {
             'GET /repos/{owner}/{repo}/git/trees/{tree_sha}': () => ({ data: { tree: [], truncated: true } })
@@ -345,20 +440,15 @@ test('commitFiles refuses to commit when the base tree listing is truncated', as
     });
 
     await assert.rejects(
-        () => commit(octokit, { preconditions: { absent: ['new.json'] } }),
+        () => commit(octokit, { preconditions: { absent: manyPaths(101) } }),
         error => error.status === 500 && /too large/.test(error.message)
     );
 
-    assert.strictEqual(octokit.callsTo('POST /repos/{owner}/{repo}/git/trees').length, 0);
+    assert.strictEqual(octokit.callsTo('commit').length, 0);
 });
 
 test('commitFiles treats every path as absent in a repository with no commits', async () => {
-    const emptyRepo = () => fakeGit({
-        head: { commitSha: null, treeSha: null },
-        overrides: {
-            'PATCH /repos/{owner}/{repo}/git/refs/{ref}': () => { throw conflict(); }
-        }
-    });
+    const emptyRepo = () => fakeGit({ head: { commitSha: null, treeSha: null } });
 
     const result = await commit(emptyRepo(), { preconditions: { absent: ['123456789.json'] } });
     assert.strictEqual(result.commitSha, 'commit-new');
@@ -398,12 +488,13 @@ test('commitFiles deletes when the branch is still at the commit the caller scan
     assert.strictEqual(result.deleted, 1);
 });
 
-test('commitFiles skips the tree read when head is the only precondition', async () => {
+test('commitFiles looks up no paths when head is the only precondition', async () => {
     const octokit = fakeGit();
 
     await commit(octokit, { preconditions: { head: 'commit-base' } });
 
-    assert.strictEqual(octokit.callsTo('GET /repos/{owner}/{repo}/git/trees/{tree_sha}').length, 0);
+    assert.deepStrictEqual(lookedUp(octokit), []);
+    assert.deepStrictEqual(octokit.restCalls(), []);
 });
 
 test('commitFiles rejects without writing when the branch moved past the scanned commit', async () => {
@@ -422,19 +513,19 @@ test('commitFiles rejects without writing when the branch moved past the scanned
         }
     );
 
-    assert.strictEqual(octokit.callsTo('POST /repos/{owner}/{repo}/git/trees').length, 0);
+    assert.strictEqual(octokit.callsTo('commit').length, 0);
 });
 
 test('commitFiles reports head as moved when a commit lands mid-write', async () => {
-    // The check passes, then another editor's commit wins the ref update
-    let head = 'commit-base';
+    // The check passes, then another editor's commit wins the write
+    const head = { commitSha: 'commit-base', treeSha: 'tree-base' };
 
     const octokit = fakeGit({
+        head,
         overrides: {
-            'GET /repos/{owner}/{repo}/git/ref/{ref}': () => ({ data: { object: { sha: head } } }),
-            'PATCH /repos/{owner}/{repo}/git/refs/{ref}': () => {
-                head = 'commit-theirs';
-                throw conflict();
+            commit: () => {
+                head.commitSha = 'commit-theirs';
+                throw stale();
             }
         }
     });
@@ -444,5 +535,24 @@ test('commitFiles reports head as moved when a commit lands mid-write', async ()
         error => error.status === 409 && error.conflicts?.[0]?.reason === 'moved'
     );
 
-    assert.strictEqual(octokit.callsTo('PATCH /repos/{owner}/{repo}/git/refs/{ref}').length, 1);
+    assert.strictEqual(octokit.callsTo('commit').length, 1);
+});
+
+test('commitFiles sends paths as query variables, never as query text', async () => {
+    const octokit = fakeGit();
+    const path = 'we"ird") { oid } evil: viewer { login } x: file(path: "y.json';
+
+    await commit(octokit, { preconditions: { absent: [path] } });
+
+    const [read] = octokit.callsTo('read');
+    assert.strictEqual(read.options.variables.p0, path);
+    assert.ok(!read.options.query.includes('we"ird'));
+});
+
+test('commitFiles looks up each path once when preconditions name it more than once', async () => {
+    const octokit = fakeGit({ baseTree: [['a.json', 'blob-a']] });
+
+    await commit(octokit, { preconditions: { present: ['a.json'], expected: { 'a.json': 'blob-a' } } });
+
+    assert.deepStrictEqual(lookedUp(octokit), ['a.json']);
 });

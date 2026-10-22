@@ -42,29 +42,15 @@ const fakeGitHub = () => {
     const head = { commit: 'commit-1', tree: 'tree-1' };
 
     return {
-        request: async (route, options) => {
-            if (route === 'GET /repos/{owner}/{repo}/git/ref/{ref}') {
-                return { status: 200, headers: {}, data: { object: { sha: head.commit } } };
+        graphql: async (query) => {
+            if (query.includes('createCommitOnBranch')) {
+                Object.assign(head, { commit: 'commit-2', tree: 'tree-2' });
+                return { createCommitOnBranch: { commit: { oid: head.commit, tree: { oid: head.tree } } } };
             }
 
-            if (route === 'GET /repos/{owner}/{repo}/git/commits/{commit_sha}') {
-                return { status: 200, headers: {}, data: { tree: { sha: head.tree } } };
-            }
-
-            if (route === 'POST /repos/{owner}/{repo}/git/trees') {
-                return { status: 201, headers: {}, data: { sha: 'tree-2' } };
-            }
-
-            if (route === 'POST /repos/{owner}/{repo}/git/commits') {
-                return { status: 201, headers: {}, data: { sha: 'commit-2' } };
-            }
-
-            if (route === 'PATCH /repos/{owner}/{repo}/git/refs/{ref}') {
-                head.commit = options.sha;
-                head.tree = 'tree-2';
-                return { status: 200, headers: {}, data: {} };
-            }
-
+            return { repository: { ref: { target: { oid: head.commit, tree: { oid: head.tree } } } } };
+        },
+        request: async (route) => {
             if (route === 'GET /repos/{owner}/{repo}/git/trees/{tree_sha}') {
                 return { status: 200, headers: {}, data: { sha: head.commit, tree: [], truncated: false } };
             }
