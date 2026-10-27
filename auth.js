@@ -11,6 +11,7 @@ const { logRequest } = require('./lib/logging');
 const { fetchSecrets } = require('./lib/secrets');
 const { API_VERSION, createClient, getFile, createFile, toBase64 } = require('./lib/github');
 const { commitFiles } = require('./domain/gitData');
+const { readHistory, readCommit } = require('./domain/history');
 const { getBaseConfig } = require('./domain/config');
 const { generateConceptID } = require('./domain/conceptId');
 
@@ -32,7 +33,9 @@ const ghauth = async (req, res) => {
         'getConcept',
         'getConfig',
         'getTree',
-        'commitFiles'
+        'commitFiles',
+        'getCommits',
+        'getCommitDetail'
     ];
 
     // Early validation for invalid API endpoints
@@ -382,6 +385,46 @@ const ghauth = async (req, res) => {
                 return res.status(200).json({ data: [], sha: null, truncated: false, status: 200 });
             }
 
+            return sendError(res, api, startedAt, error);
+        }
+    }
+
+    if (api === 'getCommits') {
+        try {
+            if (req.method !== 'GET') return res.status(405).json({error: 'Method Not Allowed'});
+
+            const token = extractToken(req);
+            if (!token) return sendUnauthorized(res, api, startedAt);
+
+            const missing = missingParams(req.query, ['owner', 'repo', 'branch']);
+            if (missing.length) return sendMissingParams(res, api, startedAt, missing);
+
+            const { owner, repo, branch, path, cursor } = req.query;
+            const { rateLimit, ...result } = await readHistory(createClient(token), { owner, repo, branch, path, cursor });
+
+            logRequest({ api, status: 200, startedAt, rateLimit, commits: result.commits.length, path: path || null });
+            res.status(200).json({ ...result, status: 200, rateLimit });
+        } catch (error) {
+            return sendError(res, api, startedAt, error);
+        }
+    }
+
+    if (api === 'getCommitDetail') {
+        try {
+            if (req.method !== 'GET') return res.status(405).json({error: 'Method Not Allowed'});
+
+            const token = extractToken(req);
+            if (!token) return sendUnauthorized(res, api, startedAt);
+
+            const missing = missingParams(req.query, ['owner', 'repo', 'sha']);
+            if (missing.length) return sendMissingParams(res, api, startedAt, missing);
+
+            const { owner, repo, sha } = req.query;
+            const { rateLimit, ...result } = await readCommit(createClient(token), { owner, repo, sha });
+
+            logRequest({ api, status: 200, startedAt, rateLimit, files: result.filesShown });
+            res.status(200).json({ ...result, status: 200, rateLimit });
+        } catch (error) {
             return sendError(res, api, startedAt, error);
         }
     }

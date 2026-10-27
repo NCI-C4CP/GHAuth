@@ -379,6 +379,7 @@ const commitFiles = async ({ octokit, owner, repo, branch, message, files = [], 
 module.exports = {
     commitFiles,
     blobSha,
+    toHttpError,
     MAX_ENTRIES_PER_COMMIT,
     WRITES_PER_COMMIT
 };
